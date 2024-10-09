@@ -1,10 +1,19 @@
 use anyhow::Result;
 use log::{info, warn};
 
-use near_jsonrpc_client::{methods::block::RpcBlockRequest, JsonRpcClient};
+use near_jsonrpc_client::{
+    methods::{self, block::RpcBlockRequest},
+    JsonRpcClient,
+};
+use near_jsonrpc_primitives::types::query::QueryResponseKind;
 use near_lake_framework::near_indexer_primitives::{
     views::{ActionView, ReceiptEnumView, ReceiptView},
     IndexerExecutionOutcomeWithReceipt, StreamerMessage,
+};
+use near_primitives::{
+    borsh::{from_slice, BorshDeserialize},
+    types::BlockReference,
+    views::QueryRequest,
 };
 use omni_types::near_events::Nep141LockerEvent;
 
@@ -23,6 +32,33 @@ pub async fn get_final_block(jsonrpc_client: &JsonRpcClient) -> Result<u64> {
         .await
         .map(|block| block.header.height)
         .map_err(Into::into)
+}
+
+#[derive(BorshDeserialize)]
+struct EthLightClientResponse {
+    last_block_number: u64,
+}
+
+pub async fn get_eth_light_client_last_block_number(
+    config: &config::Config,
+    jsonrpc_client: &JsonRpcClient,
+) -> Result<u64> {
+    let request = methods::query::RpcQueryRequest {
+        block_reference: BlockReference::latest(),
+        request: QueryRequest::CallFunction {
+            account_id: config.near.eth_light_client.clone(),
+            method_name: "last_block_number".to_string(),
+            args: Vec::new().into(),
+        },
+    };
+
+    let response = jsonrpc_client.call(request).await?;
+
+    if let QueryResponseKind::CallResult(result) = response.kind {
+        Ok(from_slice::<EthLightClientResponse>(&result.result)?.last_block_number)
+    } else {
+        anyhow::bail!("Failed to get token decimals")
+    }
 }
 
 pub async fn handle_streamer_message(
@@ -46,39 +82,51 @@ pub async fn handle_streamer_message(
             Nep141LockerEvent::InitTransferEvent {
                 ref transfer_message,
             }
-            // TODO: Later it's better to add a separate key in db for storing events with any
-            // troubles there. For now we just update whole event with a new fee for the same nonce
             | Nep141LockerEvent::UpdateFeeEvent {
                 ref transfer_message,
             } => {
-                // TODO: If fee is insufficient, it should be handled later. For example,
-                // add to redis and try again in 1 hour
                 match utils::fee::is_fee_sufficient(
                     jsonrpc_client,
                     &transfer_message.sender,
                     &transfer_message.recipient,
                     &transfer_message.token,
-                    transfer_message.fee.into(),
+                    transfer_message.fee.fee.into(),
                 )
                 .await
                 {
                     Ok(res) => {
-                        if !res {
-                            warn!("Fee is insufficient");
+                        if res {
+                            utils::redis::add_event(
+                                redis_connection,
+                                utils::redis::NEAR_INIT_TRANSFER_EVENTS,
+                                transfer_message.origin_nonce.0.to_string(),
+                                log,
+                            )
+                            .await;
+                        } else {
+                            warn!("Fee is not sufficient for transfer: {:?}", transfer_message);
+
+                            utils::redis::add_event(
+                                redis_connection,
+                                utils::redis::NEAR_BAD_FEE_EVENTS,
+                                transfer_message.origin_nonce.0.to_string(),
+                                log,
+                            )
+                            .await;
                         }
                     }
                     Err(err) => {
                         warn!("Failed to check fee: {}", err);
+
+                        utils::redis::add_event(
+                            redis_connection,
+                            utils::redis::NEAR_BAD_FEE_EVENTS,
+                            transfer_message.origin_nonce.0.to_string(),
+                            log,
+                        )
+                        .await;
                     }
                 }
-
-                utils::redis::add_event(
-                    redis_connection,
-                    utils::redis::NEAR_INIT_TRANSFER_EVENTS,
-                    transfer_message.origin_nonce.0.to_string(),
-                    log,
-                )
-                .await;
             }
             Nep141LockerEvent::SignTransferEvent {
                 ref message_payload,
@@ -92,8 +140,53 @@ pub async fn handle_streamer_message(
                 )
                 .await;
             }
-            Nep141LockerEvent::FinTransferEvent { .. }
-            | Nep141LockerEvent::LogMetadataEvent { .. } => {}
+            Nep141LockerEvent::FinTransferEvent {
+                ref nonce,
+                ref transfer_message,
+            } => {
+                if nonce.is_none() {
+                    utils::redis::add_event(
+                        redis_connection,
+                        utils::redis::NEAR_FIN_TRANSFER_EVENTS,
+                        transfer_message.origin_nonce.0.to_string(),
+                        log,
+                    )
+                    .await;
+                }
+            }
+            Nep141LockerEvent::ClaimFeeEvent {
+                ref transfer_message,
+                ref native_fee_recipient,
+            } => {
+                if native_fee_recipient == &config.evm.relayer {
+                    utils::redis::add_event(
+                        redis_connection,
+                        utils::redis::NEAR_FIN_TRANSFER_EVENTS,
+                        transfer_message.origin_nonce.0.to_string(),
+                        log,
+                    )
+                    .await;
+                }
+            }
+            Nep141LockerEvent::SignClaimNativeFeeEvent {
+                ref claim_payload, ..
+            } => {
+                utils::redis::add_event(
+                    redis_connection,
+                    utils::redis::NEAR_SIGN_CLAIM_NATIVE_FEE_EVENTS,
+                    claim_payload
+                        .nonces
+                        .iter()
+                        .map(|nonce| nonce.0.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    log,
+                )
+                .await;
+            }
+            Nep141LockerEvent::LogMetadataEvent { .. } => {
+                info!("Received LogMetadataEvent");
+            }
         }
     }
 }
